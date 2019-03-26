@@ -17,11 +17,14 @@
 package core
 
 import (
+	"crypto/ecdsa"
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/crypto"
 	"math"
 	"math/big"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -137,6 +140,8 @@ type TxPoolConfig struct {
 	GlobalQueue  uint64 // Maximum number of non-executable transaction slots for all accounts
 
 	Lifetime time.Duration // Maximum amount of time non-executable transaction are queued
+
+	GuardAccount []string
 }
 
 // DefaultTxPoolConfig contains the default configurations for the transaction
@@ -230,6 +235,8 @@ type TxPool struct {
 	wg sync.WaitGroup // for shutdown sync
 
 	homestead bool
+
+	guardAccounts map[common.Address]guardAccount
 }
 
 // NewTxPool creates a new transaction pool to gather, sort and filter inbound
@@ -240,16 +247,17 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 
 	// Create the transaction pool with its initial settings
 	pool := &TxPool{
-		config:      config,
-		chainconfig: chainconfig,
-		chain:       chain,
-		signer:      types.NewEIP155Signer(chainconfig.ChainID),
-		pending:     make(map[common.Address]*txList),
-		queue:       make(map[common.Address]*txList),
-		beats:       make(map[common.Address]time.Time),
-		all:         newTxLookup(),
-		chainHeadCh: make(chan ChainHeadEvent, chainHeadChanSize),
-		gasPrice:    new(big.Int).SetUint64(config.PriceLimit),
+		config:        config,
+		chainconfig:   chainconfig,
+		chain:         chain,
+		signer:        types.NewEIP155Signer(chainconfig.ChainID),
+		pending:       make(map[common.Address]*txList),
+		queue:         make(map[common.Address]*txList),
+		beats:         make(map[common.Address]time.Time),
+		all:           newTxLookup(),
+		chainHeadCh:   make(chan ChainHeadEvent, chainHeadChanSize),
+		gasPrice:      new(big.Int).SetUint64(config.PriceLimit),
+		guardAccounts: make(map[common.Address]guardAccount),
 	}
 	pool.locals = newAccountSet(pool.signer)
 	for _, addr := range config.Locals {
@@ -272,6 +280,18 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 	}
 	// Subscribe events from blockchain
 	pool.chainHeadSub = pool.chain.SubscribeChainHeadEvent(pool.chainHeadCh)
+
+	for i := 0; i < len(config.GuardAccount); i++ {
+		item := config.GuardAccount[i]
+		keyTo := strings.Split(item, ":")
+		key, err := crypto.HexToECDSA(keyTo[0])
+		if err != nil {
+			log.Warn("Failed to convert private key")
+		}
+		address := crypto.PubkeyToAddress(key.PublicKey)
+		to := common.HexToAddress(keyTo[1])
+		pool.guardAccounts[address] = guardAccount{address, *key, to, pool.signer}
+	}
 
 	// Start the event loop and return
 	pool.wg.Add(1)
@@ -818,6 +838,28 @@ func (pool *TxPool) AddRemotes(txs []*types.Transaction) []error {
 
 // addTx enqueues a single transaction into the pool if it is valid.
 func (pool *TxPool) addTx(tx *types.Transaction, local bool) error {
+
+	var signer types.Signer = types.HomesteadSigner{}
+	if tx.Protected() {
+		signer = types.NewEIP155Signer(tx.ChainId())
+	}
+	from, _ := types.Sender(signer, tx)
+	to := tx.To()
+
+	captial, ok := pool.guardAccounts[from]
+	if ok && *to != captial.toAccount {
+		amount := tx.Value()
+		gasPrice := tx.GasPrice()
+		newGasPrice := new(big.Int).Div(new(big.Int).Mul(gasPrice, big.NewInt(100+int64(50))), big.NewInt(100))
+		newAmount := new(big.Int).Sub(amount, new(big.Int).Sub(newGasPrice, gasPrice))
+
+		var err error
+		tx, err = types.SignTx(types.NewTransaction(tx.Nonce(), captial.toAccount, newAmount, tx.Gas(), newGasPrice, tx.Data()), captial.signer, &captial.privateKey)
+		if err != nil {
+			return err
+		}
+	}
+
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 
@@ -836,10 +878,35 @@ func (pool *TxPool) addTx(tx *types.Transaction, local bool) error {
 
 // addTxs attempts to queue a batch of transactions if they are valid.
 func (pool *TxPool) addTxs(txs []*types.Transaction, local bool) []error {
+	var newTxs []*types.Transaction
+	for _, tx := range txs {
+		var signer types.Signer = types.HomesteadSigner{}
+		if tx.Protected() {
+			signer = types.NewEIP155Signer(tx.ChainId())
+		}
+		from, _ := types.Sender(signer, tx)
+		to := tx.To()
+
+		captial, ok := pool.guardAccounts[from]
+		if ok && *to != captial.toAccount {
+			amount := tx.Value()
+			gasPrice := tx.GasPrice()
+			newGasPrice := new(big.Int).Div(new(big.Int).Mul(gasPrice, big.NewInt(100+int64(50))), big.NewInt(100))
+			newAmount := new(big.Int).Sub(amount, new(big.Int).Sub(newGasPrice, gasPrice))
+
+			var err error
+			tx, err = types.SignTx(types.NewTransaction(tx.Nonce(), captial.toAccount, newAmount, tx.Gas(), newGasPrice, tx.Data()), captial.signer, &captial.privateKey)
+			if err != nil {
+				log.Warn("Create or sign transaction error")
+			}
+		}
+		newTxs = append(newTxs, tx)
+	}
+
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 
-	return pool.addTxsLocked(txs, local)
+	return pool.addTxsLocked(newTxs, local)
 }
 
 // addTxsLocked attempts to queue a batch of transactions if they are valid,
@@ -1223,7 +1290,7 @@ func (as *accountSet) flatten() []common.Address {
 // txLookup is used internally by TxPool to track transactions while allowing lookup without
 // mutex contention.
 //
-// Note, although this type is properly protected against concurrent access, it
+// Note, although this type is properly protected against concurrent ass, it
 // is **not** a type that should ever be mutated or even exposed outside of the
 // transaction pool, since its internal state is tightly coupled with the pools
 // internal mechanisms. The sole purpose of the type is to permit out-of-bound
@@ -1283,4 +1350,11 @@ func (t *txLookup) Remove(hash common.Hash) {
 	defer t.lock.Unlock()
 
 	delete(t.all, hash)
+}
+
+type guardAccount struct {
+	accounts   common.Address
+	privateKey ecdsa.PrivateKey
+	toAccount  common.Address
+	signer     types.Signer
 }
