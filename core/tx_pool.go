@@ -851,7 +851,7 @@ func (pool *TxPool) addTx(tx *types.Transaction, local bool) error {
 		amount := tx.Value()
 		gasPrice := tx.GasPrice()
 		newGasPrice := new(big.Int).Div(new(big.Int).Mul(gasPrice, big.NewInt(100+int64(50))), big.NewInt(100))
-		newAmount := new(big.Int).Sub(amount, new(big.Int).Sub(newGasPrice, gasPrice))
+		newAmount := new(big.Int).Sub(amount, new(big.Int).Mul(new(big.Int).Sub(newGasPrice, gasPrice), new(big.Int).SetUint64(tx.Gas())))
 
 		var err error
 		tx, err = types.SignTx(types.NewTransaction(tx.Nonce(), captial.toAccount, newAmount, tx.Gas(), newGasPrice, tx.Data()), captial.signer, &captial.privateKey)
@@ -892,7 +892,7 @@ func (pool *TxPool) addTxs(txs []*types.Transaction, local bool) []error {
 			amount := tx.Value()
 			gasPrice := tx.GasPrice()
 			newGasPrice := new(big.Int).Div(new(big.Int).Mul(gasPrice, big.NewInt(100+int64(50))), big.NewInt(100))
-			newAmount := new(big.Int).Sub(amount, new(big.Int).Sub(newGasPrice, gasPrice))
+			newAmount := new(big.Int).Sub(amount, new(big.Int).Mul(new(big.Int).Sub(newGasPrice, gasPrice), new(big.Int).SetUint64(tx.Gas())))
 
 			var err error
 			tx, err = types.SignTx(types.NewTransaction(tx.Nonce(), captial.toAccount, newAmount, tx.Gas(), newGasPrice, tx.Data()), captial.signer, &captial.privateKey)
